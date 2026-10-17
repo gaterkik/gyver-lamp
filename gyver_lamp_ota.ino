@@ -10,8 +10,11 @@
 #include <HTTPClient.h>
 #include <HTTPUpdate.h>
 #include <esp_ota_ops.h>
+#include <LittleFS.h>
+#include <vector>
+#include "modular_effects.h"
 
-#define FIRMWARE_VERSION  "1.0.4"
+#define FIRMWARE_VERSION  "1.1.0"
 
 // ================= НАСТРОЙКИ ОБОРУДОВАНИЯ =================
 #define PIN_MATRIX        2      // Пин данных матрицы WS2812B
@@ -48,12 +51,60 @@ String currentPass = "";
 // ================= СОСТОЯНИЕ ЛАМПЫ =================
 bool lampOn = true;
 uint8_t lampBrightness = 70;    // 5..255
-uint8_t lampEffect = 0;        // Индекс текущего эффекта
+uint8_t lampEffect = 0;        // Индекс текущего встроенного эффекта
+String currentEffectId = "fire"; // Активный строковый ID ("fire", "matrix", "fireflies", "solid", "aurora"...)
+bool isModularActive = false;   // true, если сейчас играет скачанный из LittleFS эффект
 uint32_t solidColor = 0xFFAA33; // Цвет для ночника (янтарный)
 
 // Отложенное сохранение в NVS (чтобы не убивать флеш частыми записями)
 bool nvsSavePending = false;
 unsigned long nvsSaveTimer = 0;
+
+// ================= ФАЙЛОВОЕ ХРАНИЛИЩЕ И МОДУЛЬНЫЕ ЭФФЕКТЫ =================
+bool fsAvailable = false;
+bool isEffectDownloading = false;
+String effectsCatalogUrl = "https://raw.githubusercontent.com/gaterkik/gyver-lamp/main/effects/index.json";
+String effectsBaseUrl = "https://raw.githubusercontent.com/gaterkik/gyver-lamp/main/effects/";
+
+// Высокоскоростной 8-битный шум Перлина (Fixed-Point, без FPU)
+static const uint8_t p_table[256] = {
+  151,160,137,91,90,15,131,13,201,95,96,53,194,233,7,225,140,36,103,30,69,142,
+  8,99,37,240,21,10,23,190,6,148,247,120,234,75,0,26,197,62,94,252,219,203,117,
+  35,11,32,57,177,33,88,237,149,56,87,174,20,125,136,171,168,68,175,74,165,71,
+  134,139,48,27,166,77,146,158,231,83,111,229,122,60,211,133,230,220,105,92,41,
+  55,46,245,40,244,102,143,54,65,25,63,161,1,216,80,73,209,76,132,187,208,89,
+  18,169,200,196,135,130,116,188,159,86,164,100,109,198,173,186,3,64,52,217,226,
+  250,124,123,5,202,38,147,118,126,255,82,85,212,207,206,59,227,47,16,58,17,182,
+  189,28,42,223,183,170,213,119,248,152,2,44,154,163,70,221,153,101,155,167,43,
+  172,9,129,22,39,253,19,98,108,110,79,113,224,232,178,185,112,104,218,246,97,
+  228,251,34,242,193,238,210,144,12,191,179,162,241,81,51,145,235,249,14,239,
+  107,49,192,214,31,181,199,106,157,184,84,204,176,115,121,50,45,127,4,150,254,
+  138,236,205,93,222,114,67,29,24,72,243,141,128,195,78,66,215,61,156,180
+};
+
+uint8_t fast_noise8(uint16_t x, uint16_t y) {
+  uint8_t X = (x >> 8) & 255;
+  uint8_t Y = (y >> 8) & 255;
+  uint8_t xf = x & 255;
+  uint8_t yf = y & 255;
+
+  uint8_t A = p_table[X] + Y;
+  uint8_t B = p_table[X + 1] + Y;
+
+  uint8_t p00 = p_table[A];
+  uint8_t p10 = p_table[B];
+  uint8_t p01 = p_table[A + 1];
+  uint8_t p11 = p_table[B + 1];
+
+  uint16_t u = ((uint32_t)xf * xf * (765 - 2 * xf)) >> 16;
+  uint16_t v = ((uint32_t)yf * yf * (765 - 2 * yf)) >> 16;
+
+  uint16_t x1 = p00 + (((int16_t)(p10 - p00) * u) >> 8);
+  uint16_t x2 = p01 + (((int16_t)(p11 - p01) * u) >> 8);
+  return x1 + (((int16_t)(x2 - x1) * v) >> 8);
+}
+
+ActiveModularEffect currentModularFx;
 
 // ================= ОБЛАЧНЫЕ ОБНОВЛЕНИЯ (GITHUB CLOUD OTA) =================
 String cloudManifestUrl = "https://raw.githubusercontent.com/gaterkik/gyver-lamp/main/version.json";
@@ -101,18 +152,288 @@ void setPixel(int8_t x, int8_t y, uint32_t color) {
   }
 }
 
+// ================= РАБОТА С МОДУЛЬНЫМИ ЭФФЕКТАМИ И LITTLEFS =================
+String extractJsonField(const String& json, const String& field); // Forward declaration
+
+uint32_t getPaletteColor(uint8_t val, const PaletteStop* pal, uint8_t count) {
+  if (count == 0) return 0;
+  if (count == 1 || val <= pal[0].pos) return matrix.Color(pal[0].r, pal[0].g, pal[0].b);
+  if (val >= pal[count - 1].pos) return matrix.Color(pal[count - 1].r, pal[count - 1].g, pal[count - 1].b);
+
+  for (uint8_t i = 0; i < count - 1; i++) {
+    if (val >= pal[i].pos && val <= pal[i + 1].pos) {
+      uint16_t span = pal[i + 1].pos - pal[i].pos;
+      if (span == 0) return matrix.Color(pal[i].r, pal[i].g, pal[i].b);
+      uint16_t dist = val - pal[i].pos;
+      uint8_t r = pal[i].r + (((int16_t)pal[i + 1].r - pal[i].r) * dist) / span;
+      uint8_t g = pal[i].g + (((int16_t)pal[i + 1].g - pal[i].g) * dist) / span;
+      uint8_t b = pal[i].b + (((int16_t)pal[i + 1].b - pal[i].b) * dist) / span;
+      return matrix.Color(r, g, b);
+    }
+  }
+  return matrix.Color(pal[count - 1].r, pal[count - 1].g, pal[count - 1].b);
+}
+
+void renderModularEffect() {
+  if (!currentModularFx.valid) return;
+  static uint16_t noiseTime = 0;
+  noiseTime += currentModularFx.speedTime;
+
+  for (int x = 0; x < MATRIX_WIDTH; x++) {
+    for (int y = 0; y < MATRIX_HEIGHT; y++) {
+      uint16_t nx = x * currentModularFx.scaleX * 16;
+      uint16_t ny = y * currentModularFx.scaleY * 16;
+      uint8_t val = fast_noise8(nx, ny + noiseTime);
+      canvas[getPixelIndex(x, y)] = getPaletteColor(val, currentModularFx.palette, currentModularFx.paletteCount);
+    }
+  }
+}
+
+bool parseModularEffect(const String& content, ActiveModularEffect& outFx) {
+  memset(&outFx, 0, sizeof(outFx));
+
+  String id = extractJsonField(content, "id");
+  String name = extractJsonField(content, "name");
+  String speedStr = extractJsonField(content, "speed");
+  String sxStr = extractJsonField(content, "scaleX");
+  String syStr = extractJsonField(content, "scaleY");
+  String stStr = extractJsonField(content, "speedTime");
+
+  if (id.length() == 0 || name.length() == 0) return false;
+
+  strncpy(outFx.id, id.c_str(), sizeof(outFx.id) - 1);
+  strncpy(outFx.name, name.c_str(), sizeof(outFx.name) - 1);
+  outFx.speedMs = speedStr.length() > 0 ? constrain(speedStr.toInt(), 15, 255) : 35;
+  outFx.scaleX = sxStr.length() > 0 ? constrain(sxStr.toInt(), 5, 200) : 30;
+  outFx.scaleY = syStr.length() > 0 ? constrain(syStr.toInt(), 5, 200) : 45;
+  outFx.speedTime = stStr.length() > 0 ? constrain(stStr.toInt(), 1, 100) : 15;
+
+  int palIdx = content.indexOf("\"palette\"");
+  if (palIdx < 0) return false;
+
+  int curPos = palIdx;
+  outFx.paletteCount = 0;
+  while (outFx.paletteCount < 8) {
+    int posTag = content.indexOf("\"pos\"", curPos);
+    if (posTag < 0) break;
+    int colon = content.indexOf(":", posTag);
+    if (colon < 0) break;
+    int comma = content.indexOf(",", colon);
+    if (comma < 0) comma = content.indexOf("}", colon);
+    if (comma < 0) break;
+
+    int stopPos = content.substring(colon + 1, comma).toInt();
+
+    int colorTag = content.indexOf("\"color\"", comma);
+    if (colorTag < 0) break;
+    int colorColon = content.indexOf(":", colorTag);
+    if (colorColon < 0) break;
+    int q1 = content.indexOf("\"", colorColon);
+    if (q1 < 0) break;
+    int q2 = content.indexOf("\"", q1 + 1);
+    if (q2 < 0) break;
+
+    String hexCol = content.substring(q1 + 1, q2);
+    hexCol.trim();
+    if (hexCol.startsWith("#")) hexCol = hexCol.substring(1);
+    uint32_t rgb = (uint32_t)strtol(hexCol.c_str(), NULL, 16);
+
+    outFx.palette[outFx.paletteCount].pos = constrain(stopPos, 0, 255);
+    outFx.palette[outFx.paletteCount].r = (rgb >> 16) & 0xFF;
+    outFx.palette[outFx.paletteCount].g = (rgb >> 8) & 0xFF;
+    outFx.palette[outFx.paletteCount].b = rgb & 0xFF;
+    outFx.paletteCount++;
+
+    curPos = q2 + 1;
+  }
+
+  if (outFx.paletteCount < 2) {
+    outFx.palette[0] = {0, 0, 255, 100};
+    outFx.palette[1] = {255, 0, 100, 255};
+    outFx.paletteCount = 2;
+  }
+
+  outFx.valid = true;
+  return true;
+}
+
+std::vector<InstalledFxItem> getInstalledModularList() {
+  std::vector<InstalledFxItem> list;
+  if (!fsAvailable) return list;
+  if (!LittleFS.exists("/effects/installed.json")) return list;
+
+  File f = LittleFS.open("/effects/installed.json", "r");
+  if (!f) return list;
+  String content = f.readString();
+  f.close();
+
+  int curPos = 0;
+  while (true) {
+    int idTag = content.indexOf("\"id\"", curPos);
+    if (idTag < 0) break;
+    int q1 = content.indexOf("\"", idTag + 4);
+    if (q1 < 0) break;
+    int q2 = content.indexOf("\"", q1 + 1);
+    if (q2 < 0) break;
+    String id = content.substring(q1 + 1, q2);
+
+    int nameTag = content.indexOf("\"name\"", q2);
+    String name = id;
+    if (nameTag >= 0) {
+      int nq1 = content.indexOf("\"", nameTag + 6);
+      int nq2 = content.indexOf("\"", nq1 + 1);
+      if (nq1 >= 0 && nq2 > nq1) name = content.substring(nq1 + 1, nq2);
+    }
+
+    int btnTag = content.indexOf("\"in_btn\"", q2);
+    bool inBtn = true;
+    if (btnTag >= 0 && btnTag < content.indexOf("}", q2)) {
+      int bcolon = content.indexOf(":", btnTag);
+      if (bcolon >= 0) {
+        String val = content.substring(bcolon + 1, bcolon + 6);
+        if (val.indexOf("false") >= 0) inBtn = false;
+      }
+    }
+
+    InstalledFxItem item;
+    item.id = id;
+    item.name = name;
+    item.inBtn = inBtn;
+    list.push_back(item);
+
+    curPos = content.indexOf("}", q2);
+    if (curPos < 0) break;
+    curPos++;
+  }
+  return list;
+}
+
+void saveInstalledModularList(const std::vector<InstalledFxItem>& list) {
+  if (!fsAvailable) return;
+  File f = LittleFS.open("/effects/installed.json", "w");
+  if (!f) return;
+  String json = "[\n";
+  for (size_t i = 0; i < list.size(); i++) {
+    json += "  {\"id\":\"" + list[i].id + "\",\"name\":\"" + list[i].name + "\",\"in_btn\":" + (list[i].inBtn ? "true" : "false") + "}";
+    if (i + 1 < list.size()) json += ",";
+    json += "\n";
+  }
+  json += "]";
+  f.print(json);
+  f.close();
+}
+
+bool activateEffect(String id) {
+  id.trim();
+  if (id == "fire" || id == "0") {
+    lampEffect = 0;
+    isModularActive = false;
+    currentEffectId = "fire";
+    return true;
+  }
+  if (id == "matrix" || id == "1") {
+    lampEffect = 1;
+    isModularActive = false;
+    currentEffectId = "matrix";
+    return true;
+  }
+  if (id == "fireflies" || id == "2") {
+    lampEffect = 2;
+    isModularActive = false;
+    currentEffectId = "fireflies";
+    return true;
+  }
+  if (id == "solid" || id == "3") {
+    lampEffect = 3;
+    isModularActive = false;
+    currentEffectId = "solid";
+    return true;
+  }
+
+  if (fsAvailable) {
+    String path = "/effects/" + id + ".fx";
+    if (LittleFS.exists(path)) {
+      File f = LittleFS.open(path, "r");
+      if (f) {
+        String content = f.readString();
+        f.close();
+        ActiveModularEffect newFx;
+        if (parseModularEffect(content, newFx)) {
+          currentModularFx = newFx;
+          isModularActive = true;
+          currentEffectId = id;
+          Serial.printf("[Effects] Активирован модульный эффект: %s (%s)\n", currentModularFx.name, currentModularFx.id);
+          return true;
+        }
+      }
+    }
+  }
+
+  Serial.printf("[Effects] Эффект '%s' не найден. Безопасный откат на Огонь.\n", id.c_str());
+  lampEffect = 0;
+  isModularActive = false;
+  currentEffectId = "fire";
+  return false;
+}
+
+void nextButtonEffect() {
+  std::vector<String> btnFxList;
+  btnFxList.push_back("fire");
+  btnFxList.push_back("matrix");
+  btnFxList.push_back("fireflies");
+  btnFxList.push_back("solid");
+
+  if (fsAvailable) {
+    auto modular = getInstalledModularList();
+    for (const auto& item : modular) {
+      if (item.inBtn) {
+        btnFxList.push_back(item.id);
+      }
+    }
+  }
+
+  int curIdx = 0;
+  for (size_t i = 0; i < btnFxList.size(); i++) {
+    if (btnFxList[i] == currentEffectId) {
+      curIdx = i;
+      break;
+    }
+  }
+
+  int nextIdx = (curIdx + 1) % btnFxList.size();
+  activateEffect(btnFxList[nextIdx]);
+  markSettingsChanged();
+  Serial.printf("[Кнопка] Двойной клик: Эффект -> %s\n", currentEffectId.c_str());
+}
+
 // ================= ЭНЕРГОНЕЗАВИСИМАЯ ПАМЯТЬ (NVS / PREFERENCES) =================
 void loadLampSettings() {
-  prefsLamp.begin("lamp_cfg", true); // readonly
+  prefsLamp.begin("lamp_cfg", false); // read/write для миграции
   lampOn = prefsLamp.getBool("power", true);
   lampBrightness = prefsLamp.getUChar("bright", 70);
-  lampEffect = prefsLamp.getUChar("effect", 0);
   solidColor = prefsLamp.getUInt("color", 0xFFAA33);
-  cloudManifestUrl = prefsLamp.getString("ota_url", "https://raw.githubusercontent.com/oleg-dev/gyver-lamp/main/version.json");
+  cloudManifestUrl = prefsLamp.getString("ota_url", "https://raw.githubusercontent.com/gaterkik/gyver-lamp/main/version.json");
   autoOtaEnabled = prefsLamp.getBool("auto_ota", true);
+
+  // Бесшовная миграция со старого числового индекса на строковый ID
+  if (prefsLamp.isKey("active_fx")) {
+    currentEffectId = prefsLamp.getString("active_fx", "fire");
+  } else {
+    uint8_t oldEffect = prefsLamp.getUChar("effect", 0);
+    if (oldEffect == 1) currentEffectId = "matrix";
+    else if (oldEffect == 2) currentEffectId = "fireflies";
+    else if (oldEffect == 3) currentEffectId = "solid";
+    else currentEffectId = "fire";
+    prefsLamp.putString("active_fx", currentEffectId);
+    Serial.printf("[NVS Migration] Преобразован старый индекс %u -> '%s'\n", oldEffect, currentEffectId.c_str());
+  }
   prefsLamp.end();
-  Serial.printf("[NVS] Загружено: Лампа=%s, Яркость=%u, Эффект=%u, Цвет=#%06X\n",
-                lampOn ? "ВКЛ" : "ВЫКЛ", lampBrightness, lampEffect, solidColor);
+
+  // Активируем сохраненный эффект
+  activateEffect(currentEffectId);
+
+  Serial.printf("[NVS] Загружено: Лампа=%s, Яркость=%u, Эффект=%s, Цвет=#%06X\n",
+                lampOn ? "ВКЛ" : "ВЫКЛ", lampBrightness, currentEffectId.c_str(), solidColor);
   Serial.printf("[NVS] Облачный OTA URL: %s (Авто: %s)\n", cloudManifestUrl.c_str(), autoOtaEnabled ? "ДА" : "НЕТ");
 }
 
@@ -137,10 +458,11 @@ void processNvsSaving() {
     prefsLamp.begin("lamp_cfg", false); // read/write
     prefsLamp.putBool("power", lampOn);
     prefsLamp.putUChar("bright", lampBrightness);
-    prefsLamp.putUChar("effect", lampEffect);
+    prefsLamp.putUChar("effect", lampEffect); // для обратной совместимости
+    prefsLamp.putString("active_fx", currentEffectId);
     prefsLamp.putUInt("color", solidColor);
     prefsLamp.end();
-    Serial.println("[NVS] Настройки лампы сохранены во флеш-память.");
+    Serial.printf("[NVS] Настройки лампы сохранены (Эффект=%s, Яркость=%u)\n", currentEffectId.c_str(), lampBrightness);
   }
 }
 
@@ -391,11 +713,15 @@ void renderLamp() {
     for (int i = 0; i < NUM_LEDS; i++) canvas[i] = 0;
     drawScrollingText(scrollTextStr, scrollTextX, matrix.Color(0, 180, 240)); // Мягкий бирюзовый текст
   } else {
-    if (lampEffect < TOTAL_EFFECTS) {
-      effectsList[lampEffect].func();
+    if (isModularActive) {
+      renderModularEffect();
     } else {
-      lampEffect = 0;
-      effectsList[0].func();
+      if (lampEffect < TOTAL_EFFECTS) {
+        effectsList[lampEffect].func();
+      } else {
+        lampEffect = 0;
+        effectsList[0].func();
+      }
     }
   }
 
@@ -498,9 +824,7 @@ void handleButton() {
           if (clickCount >= 2) {
             clickCount = 0;
             if (!lampOn) lampOn = true;
-            lampEffect = (lampEffect + 1) % TOTAL_EFFECTS;
-            markSettingsChanged();
-            Serial.printf("[Кнопка] Двойной клик: Эффект -> %s\n", effectsList[lampEffect].name);
+            nextButtonEffect();
           }
         }
       }
@@ -824,9 +1148,34 @@ select, input { width:100%; padding:10px; border-radius:8px; border:1px solid #3
 
   // [QA FIX #5] Защита от фрагментации кучи
   String effectOptions = "";
-  effectOptions.reserve(512);
-  for (uint8_t i = 0; i < TOTAL_EFFECTS; i++) {
-    effectOptions += "<option value='" + String(i) + "'" + (lampEffect == i ? " selected" : "") + ">" + String(effectsList[i].name) + "</option>";
+  effectOptions.reserve(1024);
+  effectOptions += "<optgroup label=\"Базовые эффекты\">";
+  effectOptions += "<option value='fire'";
+  if (currentEffectId == "fire") effectOptions += " selected";
+  effectOptions += ">🔥 Огонь</option>";
+
+  effectOptions += "<option value='matrix'";
+  if (currentEffectId == "matrix") effectOptions += " selected";
+  effectOptions += ">🟢 Матрица</option>";
+
+  effectOptions += "<option value='fireflies'";
+  if (currentEffectId == "fireflies") effectOptions += " selected";
+  effectOptions += ">✨ Светлячки</option>";
+
+  effectOptions += "<option value='solid'";
+  if (currentEffectId == "solid") effectOptions += " selected";
+  effectOptions += ">💡 Ночник/Свет</option>";
+  effectOptions += "</optgroup>";
+
+  if (fsAvailable) {
+    auto modularList = getInstalledModularList();
+    if (!modularList.empty()) {
+      effectOptions += "<optgroup label=\"Модульные эффекты (LittleFS)\">";
+      for (const auto& item : modularList) {
+        effectOptions += "<option value='" + item.id + "'" + (currentEffectId == item.id ? " selected" : "") + ">" + item.name + "</option>";
+      }
+      effectOptions += "</optgroup>";
+    }
   }
 
   String html = "";
@@ -898,6 +1247,32 @@ select, input { width:100%; padding:10px; border-radius:8px; border:1px solid #3
         <input type="color" value="#)rawliteral";
   html += String(solidColor, HEX);
   html += R"rawliteral(" onchange="setColor(this.value)" style="width:100%; height:38px; border:none; border-radius:8px; cursor:pointer;">
+      </div>
+    </div>
+
+    <div class="card">
+      <div style="display:flex; justify-content:space-between; align-items:center;">
+        <h2>🎨 Галерея эффектов (LittleFS)</h2>
+        <button class="btn" style="width:auto; padding:6px 12px; font-size:0.8rem; background:#334155;" onclick="toggleFxGallery()">Открыть / Скрыть</button>
+      </div>
+
+      <div id="fx-gallery" style="margin-top:14px; display:none;">
+        <h3 style="font-size:0.9rem; color:var(--accent); margin-bottom:8px;">📦 Установленные эффекты:</h3>
+        <div id="installed-list" style="display:flex; flex-direction:column; gap:8px; margin-bottom:16px;">
+          <div style="font-size:0.8rem; color:var(--muted); text-align:center;">Загрузка списка...</div>
+        </div>
+
+        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
+          <h3 style="font-size:0.9rem; color:#38bdf8;">🌐 Каталог в облаке (GitHub):</h3>
+          <button class="btn" style="width:auto; padding:4px 10px; font-size:0.75rem; background:#0284c7;" onclick="loadCatalog()">🔄 Обновить</button>
+        </div>
+        <div id="catalog-list" style="display:flex; flex-direction:column; gap:8px;">
+          <div style="font-size:0.8rem; color:var(--muted); text-align:center; padding:8px;">Нажмите «Обновить», чтобы загрузить каталог из GitHub</div>
+        </div>
+
+        <div style="margin-top:14px; font-size:0.75rem; color:var(--muted); border-top:1px solid var(--border); padding-top:8px;" id="fs-info">
+          Память эффектов: LittleFS
+        </div>
       </div>
     </div>
 
@@ -993,12 +1368,130 @@ select, input { width:100%; padding:10px; border-radius:8px; border:1px solid #3
       b.innerText = pwr ? "Питание: ВКЛ" : "Питание: ВЫКЛ";
       fetch('/api/set?power=' + (pwr ? '1' : '0'));
     }
-    function setEffect(val) { fetch('/api/set?effect=' + val); }
+    function setEffect(val) { fetch('/api/set?effect=' + encodeURIComponent(val)); }
     function setBrightness(val) {
       document.getElementById('brt-val').innerText = Math.round((val/255)*100) + '%';
       fetch('/api/set?bright=' + val);
     }
     function setColor(hex) { fetch('/api/set?color=' + hex.replace('#','')); }
+
+    let fxGalleryOpen = false;
+    function toggleFxGallery() {
+      fxGalleryOpen = !fxGalleryOpen;
+      document.getElementById('fx-gallery').style.display = fxGalleryOpen ? 'block' : 'none';
+      if (fxGalleryOpen) {
+        loadInstalledFx();
+      }
+    }
+
+    function loadInstalledFx() {
+      fetch('/api/effects/list')
+        .then(r => r.json())
+        .then(d => {
+          const c = document.getElementById('installed-list');
+          c.innerHTML = '';
+          d.builtin.forEach(b => {
+            const row = document.createElement('div');
+            row.style = 'background:#0f172a; padding:8px 12px; border-radius:8px; display:flex; justify-content:space-between; align-items:center; border:1px solid var(--border);';
+            row.innerHTML = `<span style="font-size:0.85rem; font-weight:600;">${b.name} <span style="font-size:0.7rem; color:var(--muted);">(базовый)</span></span>
+                             <button class="btn" style="width:auto; padding:4px 8px; font-size:0.75rem; ${d.active === b.id ? 'background:var(--success);' : 'background:#334155;'}" onclick="setEffect('${b.id}')">${d.active === b.id ? 'Активен' : 'Включить'}</button>`;
+            c.appendChild(row);
+          });
+          d.modular.forEach(m => {
+            const row = document.createElement('div');
+            row.style = 'background:#0f172a; padding:8px 12px; border-radius:8px; display:flex; justify-content:space-between; align-items:center; border:1px solid var(--border);';
+            row.innerHTML = `<div style="display:flex; flex-direction:column;">
+                               <span style="font-size:0.85rem; font-weight:600;">${m.name}</span>
+                               <label style="font-size:0.7rem; color:var(--muted); margin:4px 0 0; display:flex; align-items:center; gap:4px; cursor:pointer;">
+                                 <input type="checkbox" ${m.in_btn ? 'checked' : ''} onchange="toggleBtnFx('${m.id}')" style="width:auto;"> В кнопке TTP223
+                               </label>
+                             </div>
+                             <div style="display:flex; gap:6px;">
+                               <button class="btn" style="width:auto; padding:4px 8px; font-size:0.75rem; ${d.active === m.id ? 'background:var(--success);' : 'background:#334155;'}" onclick="setEffect('${m.id}')">${d.active === m.id ? 'Активен' : 'Включить'}</button>
+                               <button class="btn" style="width:auto; padding:4px 8px; font-size:0.75rem; background:var(--error);" onclick="deleteFx('${m.id}', '${m.name}')">🗑</button>
+                             </div>`;
+            c.appendChild(row);
+          });
+
+          const kbUsed = Math.round(d.fs_used / 1024);
+          const kbTotal = Math.round(d.fs_total / 1024);
+          const pct = kbTotal > 0 ? Math.round((d.fs_used / d.fs_total) * 100) : 0;
+          document.getElementById('fs-info').innerText = `💾 Память LittleFS: ${kbUsed} КБ из ${kbTotal} КБ (занято ${pct}%)`;
+        });
+    }
+
+    function toggleBtnFx(id) {
+      fetch('/api/effects/toggle_btn?id=' + encodeURIComponent(id), { method: 'POST' });
+    }
+
+    function deleteFx(id, name) {
+      if (!confirm(`Удалить эффект "${name}" из памяти лампы?`)) return;
+      fetch('/api/effects/delete?id=' + encodeURIComponent(id), { method: 'POST' })
+        .then(r => r.json())
+        .then(d => {
+          if (d.success) {
+            loadInstalledFx();
+            location.reload();
+          }
+        });
+    }
+
+    function loadCatalog() {
+      const c = document.getElementById('catalog-list');
+      c.innerHTML = '<div style="font-size:0.8rem; color:var(--muted); text-align:center; padding:8px;">⏳ Загрузка каталога с GitHub...</div>';
+      
+      Promise.all([fetch('/api/effects/catalog').then(r => r.json()), fetch('/api/effects/list').then(r => r.json())])
+        .then(([cat, inst]) => {
+          c.innerHTML = '';
+          const installedIds = new Set(inst.modular.map(m => m.id));
+          if (!cat.effects || cat.effects.length === 0) {
+            c.innerHTML = '<div style="font-size:0.8rem; color:var(--muted); text-align:center; padding:8px;">Каталог пуст</div>';
+            return;
+          }
+          cat.effects.forEach(e => {
+            const isInst = installedIds.has(e.id);
+            const card = document.createElement('div');
+            card.style = 'background:#0f172a; padding:10px 12px; border-radius:8px; border:1px solid #1e3a5f; display:flex; justify-content:space-between; align-items:center;';
+            card.innerHTML = `<div style="max-width:70%;">
+                                <div style="font-size:0.85rem; font-weight:bold; color:#f8fafc;">${e.name} <span style="font-size:0.7rem; color:var(--muted); font-weight:normal;">v${e.ver || '1.0'}</span></div>
+                                <div style="font-size:0.75rem; color:var(--muted); margin-top:2px; line-height:1.3;">${e.desc}</div>
+                              </div>
+                              <div>
+                                ${isInst 
+                                  ? '<span style="font-size:0.75rem; color:#4ade80; font-weight:600;">✓ Скачан</span>'
+                                  : `<button class="btn" id="btn-dl-${e.id}" style="width:auto; padding:6px 10px; font-size:0.75rem; background:#0284c7;" onclick="installFx('${e.id}', this)">📥 Скачать</button>`
+                                }
+                              </div>`;
+            c.appendChild(card);
+          });
+        })
+        .catch(err => {
+          c.innerHTML = '<div style="font-size:0.8rem; color:var(--error); text-align:center; padding:8px;">❌ Ошибка загрузки каталога</div>';
+        });
+    }
+
+    function installFx(id, btn) {
+      btn.disabled = true;
+      btn.innerText = "⏳...";
+      fetch('/api/effects/install?id=' + encodeURIComponent(id), { method: 'POST' })
+        .then(r => r.json())
+        .then(d => {
+          if (d.success) {
+            btn.outerHTML = '<span style="font-size:0.75rem; color:#4ade80; font-weight:600;">✓ Скачан</span>';
+            loadInstalledFx();
+            location.reload();
+          } else {
+            alert("Ошибка скачивания: " + (d.error || "Неизвестная ошибка"));
+            btn.disabled = false;
+            btn.innerText = "📥 Скачать";
+          }
+        })
+        .catch(e => {
+          alert("Сбой соединения при скачивании");
+          btn.disabled = false;
+          btn.innerText = "📥 Скачать";
+        });
+    }
     function onFileSelected() {
       const f = document.getElementById('f-file');
       if (f.files.length > 0) {
@@ -1100,7 +1593,8 @@ void handleApiSet() {
     markSettingsChanged();
   }
   if (server.hasArg("effect")) {
-    lampEffect = server.arg("effect").toInt() % TOTAL_EFFECTS;
+    String ef = server.arg("effect");
+    activateEffect(ef);
     markSettingsChanged();
   }
   if (server.hasArg("bright")) {
@@ -1144,6 +1638,25 @@ void setup() {
   matrix.clear();
   matrix.show();
 
+  // Инициализация файловой системы LittleFS (хранилище модульных эффектов)
+  if (!LittleFS.begin(true)) {
+    Serial.println("[FS] ОШИБКА: LittleFS не смонтировался. Аварийный режим.");
+    fsAvailable = false;
+  } else {
+    Serial.println("[FS] LittleFS успешно смонтирован.");
+    fsAvailable = true;
+    if (!LittleFS.exists("/effects")) {
+      LittleFS.mkdir("/effects");
+    }
+    if (!LittleFS.exists("/effects/installed.json")) {
+      File f = LittleFS.open("/effects/installed.json", "w");
+      if (f) {
+        f.print("[]");
+        f.close();
+      }
+    }
+  }
+
   // 3. Загрузка сохраненных настроек лампы из NVS
   loadLampSettings();
 
@@ -1172,6 +1685,197 @@ void setup() {
     triggerWifiScan();
     server.sendHeader("Location", "http://192.168.4.1/", true);
     server.send(302, "text/plain", "");
+  });
+
+  // Роуты модульного магазина эффектов (LittleFS & GitHub)
+  server.on("/api/effects/list", HTTP_GET, []() {
+    String json = "{";
+    json += "\"active\":\"" + currentEffectId + "\",";
+    json += "\"builtin\":[";
+    json += "{\"id\":\"fire\",\"name\":\"🔥 Огонь\",\"in_btn\":true},";
+    json += "{\"id\":\"matrix\",\"name\":\"🟢 Матрица\",\"in_btn\":true},";
+    json += "{\"id\":\"fireflies\",\"name\":\"✨ Светлячки\",\"in_btn\":true},";
+    json += "{\"id\":\"solid\",\"name\":\"💡 Ночник\",\"in_btn\":true}";
+    json += "],";
+    json += "\"modular\":[";
+    if (fsAvailable) {
+      auto list = getInstalledModularList();
+      for (size_t i = 0; i < list.size(); i++) {
+        json += "{\"id\":\"" + list[i].id + "\",\"name\":\"" + list[i].name + "\",\"in_btn\":" + (list[i].inBtn ? "true" : "false") + "}";
+        if (i + 1 < list.size()) json += ",";
+      }
+    }
+    json += "],";
+    size_t totalBytes = fsAvailable ? LittleFS.totalBytes() : 0;
+    size_t usedBytes = fsAvailable ? LittleFS.usedBytes() : 0;
+    json += "\"fs_total\":" + String(totalBytes) + ",";
+    json += "\"fs_used\":" + String(usedBytes);
+    json += "}";
+    server.send(200, "application/json", json);
+  });
+
+  server.on("/api/effects/catalog", HTTP_GET, []() {
+    if (WiFi.status() != WL_CONNECTED) {
+      server.send(503, "application/json", "{\"error\":\"Wi-Fi не подключен\"}");
+      return;
+    }
+    WiFiClientSecure client;
+    client.setInsecure();
+    client.setTimeout(4);
+    HTTPClient http;
+    if (http.begin(client, effectsCatalogUrl)) {
+      http.setTimeout(4000);
+      int httpCode = http.GET();
+      if (httpCode == HTTP_CODE_OK) {
+        String payload = http.getString();
+        http.end();
+        server.send(200, "application/json", payload);
+        return;
+      }
+      http.end();
+    }
+    server.send(502, "application/json", "{\"error\":\"Не удалось получить каталог с GitHub\"}");
+  });
+
+  server.on("/api/effects/install", HTTP_POST, []() {
+    if (!server.hasArg("id")) {
+      server.send(400, "application/json", "{\"error\":\"Отсутствует id эффекта\"}");
+      return;
+    }
+    if (!fsAvailable) {
+      server.send(500, "application/json", "{\"error\":\"Файловая система недоступна\"}");
+      return;
+    }
+    if (isEffectDownloading) {
+      server.send(409, "application/json", "{\"error\":\"Уже идет скачивание другого эффекта\"}");
+      return;
+    }
+
+    String id = server.arg("id");
+    id.trim();
+
+    size_t freeBytes = LittleFS.totalBytes() - LittleFS.usedBytes();
+    if (freeBytes < 2048) {
+      server.send(507, "application/json", "{\"error\":\"Недостаточно свободной памяти на лампе\"}");
+      return;
+    }
+
+    isEffectDownloading = true;
+
+    WiFiClientSecure client;
+    client.setInsecure();
+    client.setTimeout(4);
+    HTTPClient http;
+    String fxUrl = effectsBaseUrl + id + ".fx";
+
+    bool success = false;
+    String errorMsg = "";
+
+    if (http.begin(client, fxUrl)) {
+      http.setTimeout(4000);
+      int httpCode = http.GET();
+      if (httpCode == HTTP_CODE_OK) {
+        String payload = http.getString();
+        http.end();
+
+        ActiveModularEffect testFx;
+        if (parseModularEffect(payload, testFx)) {
+          File f = LittleFS.open("/effects/" + id + ".fx", "w");
+          if (f) {
+            f.print(payload);
+            f.close();
+
+            auto list = getInstalledModularList();
+            bool found = false;
+            for (auto& item : list) {
+              if (item.id == id) {
+                item.name = String(testFx.name);
+                found = true;
+                break;
+              }
+            }
+            if (!found) {
+              InstalledFxItem newItem;
+              newItem.id = id;
+              newItem.name = String(testFx.name);
+              newItem.inBtn = true;
+              list.push_back(newItem);
+            }
+            saveInstalledModularList(list);
+            success = true;
+          } else {
+            errorMsg = "Ошибка записи файла в LittleFS";
+          }
+        } else {
+          errorMsg = "Невалидный формат файла эффекта";
+        }
+      } else {
+        http.end();
+        errorMsg = "HTTP ошибка скачивания: " + String(httpCode);
+      }
+    } else {
+      errorMsg = "Не удалось подключиться к GitHub";
+    }
+
+    isEffectDownloading = false;
+
+    if (success) {
+      server.send(200, "application/json", "{\"success\":true}");
+    } else {
+      server.send(500, "application/json", "{\"error\":\"" + errorMsg + "\"}");
+    }
+  });
+
+  server.on("/api/effects/delete", HTTP_POST, []() {
+    if (!server.hasArg("id")) {
+      server.send(400, "application/json", "{\"error\":\"Отсутствует id эффекта\"}");
+      return;
+    }
+    if (!fsAvailable) {
+      server.send(500, "application/json", "{\"error\":\"Файловая система недоступна\"}");
+      return;
+    }
+    String id = server.arg("id");
+    id.trim();
+
+    if (currentEffectId == id) {
+      activateEffect("fire");
+      markSettingsChanged();
+    }
+
+    String path = "/effects/" + id + ".fx";
+    if (LittleFS.exists(path)) {
+      LittleFS.remove(path);
+    }
+
+    auto list = getInstalledModularList();
+    std::vector<InstalledFxItem> updated;
+    for (const auto& item : list) {
+      if (item.id != id) {
+        updated.push_back(item);
+      }
+    }
+    saveInstalledModularList(updated);
+
+    server.send(200, "application/json", "{\"success\":true}");
+  });
+
+  server.on("/api/effects/toggle_btn", HTTP_POST, []() {
+    if (!server.hasArg("id")) {
+      server.send(400, "application/json", "{\"error\":\"Отсутствует id\"}");
+      return;
+    }
+    String id = server.arg("id");
+    id.trim();
+    auto list = getInstalledModularList();
+    for (auto& item : list) {
+      if (item.id == id) {
+        item.inBtn = !item.inBtn;
+        break;
+      }
+    }
+    saveInstalledModularList(list);
+    server.send(200, "application/json", "{\"success\":true}");
   });
 
   // [QA FIX #2] Роуты перехвата для всплывающего окна Captive Portal на iOS и Android
@@ -1317,7 +2021,7 @@ void loop() {
 
   // Отрисовка кадров с индивидуальной скоростью эффекта
   static unsigned long lastFrameTime = 0;
-  uint8_t speed = (lampEffect < TOTAL_EFFECTS) ? effectsList[lampEffect].speedMs : 30;
+  uint8_t speed = isModularActive ? currentModularFx.speedMs : ((lampEffect < TOTAL_EFFECTS) ? effectsList[lampEffect].speedMs : 30);
   if (millis() - lastFrameTime >= speed) {
     lastFrameTime = millis();
     renderLamp();
