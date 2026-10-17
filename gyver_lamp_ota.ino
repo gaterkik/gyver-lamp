@@ -11,7 +11,7 @@
 #include <HTTPUpdate.h>
 #include <esp_ota_ops.h>
 
-#define FIRMWARE_VERSION  "1.0.3"
+#define FIRMWARE_VERSION  "1.0.4"
 
 // ================= НАСТРОЙКИ ОБОРУДОВАНИЯ =================
 #define PIN_MATRIX        2      // Пин данных матрицы WS2812B
@@ -69,8 +69,9 @@ bool initialCloudCheckDone = false;
 
 // Массив тепла для эффекта Огня
 byte heat[MATRIX_WIDTH][MATRIX_HEIGHT];
-// Координаты капель для эффекта Матрицы
-int8_t matrixDrops[MATRIX_WIDTH];
+// Параметры капель для эффекта Матрицы (разная длина линий)
+int8_t matrixDropY[MATRIX_WIDTH];
+uint8_t matrixDropLen[MATRIX_WIDTH];
 // Фаза для эффекта Радуги
 uint16_t rainbowHue = 0;
 // Чистый буфер несжатого кадра (для чистого расчета эффектов и точного ограничения тока)
@@ -183,23 +184,65 @@ void effectFire() {
   }
 }
 
-// 2. Матрица
-void effectMatrix() {
-  for (int i = 0; i < NUM_LEDS; i++) {
-    uint32_t c = canvas[i];
-    uint8_t g = (c >> 8) & 0xFF;
-    g = (g > 16) ? g - 16 : 0;
-    canvas[i] = matrix.Color(0, g, 0);
+// 2. Матрица (Цифровой дождь с линиями разной длины)
+static uint8_t getRandomMatrixLength() {
+  uint8_t r = random(0, 100);
+  if (r < 30) {
+    return random(3, 6);   // Короткие стрелы: 3..5 пикселей
+  } else if (r < 75) {
+    return random(6, 10);  // Средние линии: 6..9 пикселей
+  } else {
+    return random(10, 15); // Длинные спадающие потоки: 10..14 пикселей
   }
+}
+
+void effectMatrix() {
+  static bool matrixInitialized = false;
+  if (!matrixInitialized) {
+    for (int x = 0; x < MATRIX_WIDTH; x++) {
+      matrixDropY[x] = random(-10, MATRIX_HEIGHT);
+      matrixDropLen[x] = getRandomMatrixLength();
+    }
+    matrixInitialized = true;
+  }
+
+  // Очищаем буфер кадра (каждая линия четко сохраняет свою индивидуальную длину)
+  for (int i = 0; i < NUM_LEDS; i++) canvas[i] = 0;
+
   for (int x = 0; x < MATRIX_WIDTH; x++) {
-    if (matrixDrops[x] < 0) {
-      if (random(0, 100) < 8) matrixDrops[x] = MATRIX_HEIGHT - 1;
-    } else {
-      setPixel(x, matrixDrops[x], matrix.Color(180, 255, 180));
-      if (matrixDrops[x] + 1 < MATRIX_HEIGHT) {
-        setPixel(x, matrixDrops[x] + 1, matrix.Color(0, 255, 0));
+    int8_t headY = matrixDropY[x];
+    uint8_t len = matrixDropLen[x];
+
+    // Проверяем, видна ли хоть какая-то часть линии на матрице
+    if (headY + len > 0 && headY < MATRIX_HEIGHT + 2) {
+      for (uint8_t k = 0; k < len; k++) {
+        int8_t y = headY + k;
+        if (y >= 0 && y < MATRIX_HEIGHT) {
+          if (k == 0) {
+            // Голова линии — яркая бело-зеленая искра
+            setPixel(x, y, matrix.Color(200, 255, 200));
+          } else if (k == 1) {
+            // Первый пиксель за головой — насыщенный неоновый зеленый
+            setPixel(x, y, matrix.Color(0, 255, 30));
+          } else {
+            // Тело хвоста: градиентное затухание от 230 вниз до 25
+            uint8_t g = 230 - ((k - 1) * 205 / (len > 2 ? len - 2 : 1));
+            // Цифровой глитч: случайная вспышка меняющегося символа (4%)
+            if (random(0, 100) < 4) {
+              g = (g > 175) ? 255 : g + 80;
+            }
+            setPixel(x, y, matrix.Color(0, g, 0));
+          }
+        }
       }
-      matrixDrops[x]--;
+      // Смещаем линию вниз на 1 пиксель
+      matrixDropY[x]--;
+    } else {
+      // Линия полностью ушла за нижний край — шанс появления новой линии со случайной длиной
+      if (random(0, 100) < 12) {
+        matrixDropY[x] = MATRIX_HEIGHT - 1;
+        matrixDropLen[x] = getRandomMatrixLength();
+      }
     }
   }
 }

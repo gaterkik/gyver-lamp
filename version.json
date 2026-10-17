@@ -1,5 +1,5 @@
 {
-  "version": "1.0.3",
+  "version": "1.0.4",
   "url": "https://raw.githubusercontent.com/gaterkik/gyver-lamp/main/gyver_lamp_ota.ino.bin",
-  "changelog": "Версия 1.0.3: Новый адрес http://lamp.local, бегущая строка IP при старте, удалена радуга!"
+  "changelog": "Версия 1.0.4: Матричный дождь нового поколения — спадающие линии теперь разной длины с яркими вспышками во главе и градиентными хвостами!"
 }
