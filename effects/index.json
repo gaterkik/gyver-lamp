@@ -1,0 +1,35 @@
+{
+  "version": 1,
+  "effects": [
+    {
+      "id": "aurora",
+      "name": "🌌 Северное сияние",
+      "desc": "Плавные изумрудные и фиолетовые волны полярного неба",
+      "author": "Oleg",
+      "ver": "1.0",
+      "min_firmware": "1.1.0",
+      "file": "aurora.fx",
+      "size": 380
+    },
+    {
+      "id": "lava",
+      "name": "🌋 Лавовая лампа",
+      "desc": "Теплые поднимающиеся сгустки расплавленного воска",
+      "author": "Oleg",
+      "ver": "1.0",
+      "min_firmware": "1.1.0",
+      "file": "lava.fx",
+      "size": 360
+    },
+    {
+      "id": "waterfall",
+      "name": "🌊 Водопад",
+      "desc": "Бурлящие струи горного потока с пенными всплесками",
+      "author": "Oleg",
+      "ver": "1.0",
+      "min_firmware": "1.1.0",
+      "file": "waterfall.fx",
+      "size": 390
+    }
+  ]
+}
