@@ -15,7 +15,7 @@
 #include "modular_effects.h"
 #include "audio_analyzer.h"
 
-#define FIRMWARE_VERSION  "1.2.1"
+#define FIRMWARE_VERSION  "1.2.2"
 
 // ================= НАСТРОЙКИ ОБОРУДОВАНИЯ =================
 #define PIN_MATRIX        2      // Пин данных матрицы WS2812B
@@ -1508,6 +1508,24 @@ select, input { width:100%; padding:10px; border-radius:8px; border:1px solid #3
       <div class="row"><span>Время работы:</span><span class="val">)rawliteral";
   html += getUptime();
   html += R"rawliteral(</span></div>
+      <div class="row"><span>Температура CPU:</span><span class="val">)rawliteral";
+  float cpuTemp = temperatureRead();
+  if (isnan(cpuTemp) || cpuTemp < -40.0f || cpuTemp > 125.0f) {
+    html += "Н/Д";
+  } else {
+    html += String(cpuTemp, 1) + " °C";
+  }
+  html += R"rawliteral(</span></div>
+      <div class="row"><span>Flash-память (ПЗУ):</span><span class="val">)rawliteral";
+  uint32_t flashBytes = ESP.getFlashChipSize();
+  uint32_t flashMb = flashBytes / (1024 * 1024);
+  html += String(flashMb) + " МБ (" + String(flashBytes / 1024) + " КБ)";
+  html += R"rawliteral(</span></div>
+      <div class="row"><span>Оперативная память (RAM):</span><span class="val">)rawliteral";
+  uint32_t freeRamKb = ESP.getFreeHeap() / 1024;
+  uint32_t totalRamKb = ESP.getHeapSize() / 1024;
+  html += String(freeRamKb) + " КБ свободно из " + String(totalRamKb) + " КБ";
+  html += R"rawliteral(</span></div>
       <div style="margin-top:10px;">
         <button class="btn" style="background:#334155; padding:8px; font-size:0.85rem;" onclick="fetch('/api/show_ip')">📟 Показать IP на лампе бегущей строкой</button>
       </div>
@@ -2183,13 +2201,20 @@ void setup() {
 
   // 6. Роуты облачного OTA (GitHub)
   server.on("/api/ota/status", HTTP_GET, []() {
+    float cpuTemp = temperatureRead();
+    uint32_t flashBytes = ESP.getFlashChipSize();
     String json = "{";
     json += "\"current\":\"" + String(FIRMWARE_VERSION) + "\",";
     json += "\"available\":" + String(cloudUpdateAvailable ? "true" : "false") + ",";
     json += "\"cloud_version\":\"" + cloudVersion + "\",";
     json += "\"changelog\":\"" + cloudChangelog + "\",";
     json += "\"url\":\"" + cloudManifestUrl + "\",";
-    json += "\"auto_ota\":" + String(autoOtaEnabled ? "true" : "false");
+    json += "\"auto_ota\":" + String(autoOtaEnabled ? "true" : "false") + ",";
+    json += "\"flash_mb\":" + String(flashBytes / (1024 * 1024)) + ",";
+    json += "\"flash_bytes\":" + String(flashBytes) + ",";
+    json += "\"ram_free_kb\":" + String(ESP.getFreeHeap() / 1024) + ",";
+    json += "\"ram_total_kb\":" + String(ESP.getHeapSize() / 1024) + ",";
+    json += "\"temp_c\":" + String((isnan(cpuTemp) || cpuTemp < -40.0f || cpuTemp > 125.0f) ? 0.0f : cpuTemp, 1);
     json += "}";
     server.send(200, "application/json", json);
   });
