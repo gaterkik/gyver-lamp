@@ -14,7 +14,7 @@
 #include <vector>
 #include "modular_effects.h"
 
-#define FIRMWARE_VERSION  "1.1.0"
+#define FIRMWARE_VERSION  "1.1.1"
 
 // ================= НАСТРОЙКИ ОБОРУДОВАНИЯ =================
 #define PIN_MATRIX        2      // Пин данных матрицы WS2812B
@@ -909,7 +909,7 @@ String extractJsonField(const String& json, const String& field) {
   return json.substring(startQuote + 1, endQuote);
 }
 
-void performCloudUpdate(); // прототип
+void performCloudUpdate(bool silent = false); // прототип
 
 // Проверка наличия свежей прошивки в облаке
 bool checkCloudUpdate(bool triggerUpdateIfStandby) {
@@ -946,10 +946,10 @@ bool checkCloudUpdate(bool triggerUpdateIfStandby) {
         Serial.printf("[Cloud OTA] Найдено обновление: v%s (текущая: v%s)\n", cloudVersion.c_str(), FIRMWARE_VERSION);
         Serial.printf("[Cloud OTA] Описание от создателя: %s\n", cloudChangelog.c_str());
 
-        // Продуктовое правило: если лампа ВЫКЛЮЧЕНА (standby) и включено автообновление
+        // Продуктовое правило: если лампа ВЫКЛЮЧЕНА (standby) и включено автообновление -> ТИХОЕ обновление
         if (triggerUpdateIfStandby && autoOtaEnabled && !lampOn) {
-          Serial.println("[Cloud OTA] Лампа выключена (standby). Запуск фонового обновления...");
-          performCloudUpdate();
+          Serial.println("[Cloud OTA] Лампа выключена (standby). Запуск полностью тихого фонового обновления...");
+          performCloudUpdate(true); // silent = true: матрица остается абсолютно темной
         }
         return true;
       } else {
@@ -965,32 +965,41 @@ bool checkCloudUpdate(bool triggerUpdateIfStandby) {
 }
 
 // Запуск процесса загрузки и прошивки
-void performCloudUpdate() {
+void performCloudUpdate(bool silent) {
   if (cloudBinUrl.length() == 0 || isUpdatingCloudOta) return;
   if (WiFi.status() != WL_CONNECTED) return;
 
   isUpdatingCloudOta = true;
-  Serial.printf("[Cloud OTA] Старт загрузки прошивки v%s...\n", cloudVersion.c_str());
+  Serial.printf("[Cloud OTA] Старт загрузки прошивки v%s (silent=%s)...\n", cloudVersion.c_str(), silent ? "true" : "false");
+
+  if (silent) {
+    matrix.clear();
+    matrix.show();
+  }
 
   WiFiClientSecure client;
   client.setInsecure();
 
   httpUpdate.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
 
-  // Мягкий неслепящий прогресс-бар на матрице (10-15% яркости)
-  httpUpdate.onProgress([](int cur, int total) {
-    if (total > 0) {
-      int ledsToLight = ((int64_t)cur * NUM_LEDS) / total;
-      for (int i = 0; i < NUM_LEDS; i++) {
-        if (i < ledsToLight) {
-          matrix.setPixelColor(i, matrix.Color(0, 30, 45)); // Мягкий бирюзовый
-        } else {
-          matrix.setPixelColor(i, 0);
+  // Мягкий неслепящий прогресс-бар на матрице показываем ТОЛЬКО в интерактивном режиме (ручной запуск)
+  if (!silent) {
+    httpUpdate.onProgress([](int cur, int total) {
+      if (total > 0) {
+        int ledsToLight = ((int64_t)cur * NUM_LEDS) / total;
+        for (int i = 0; i < NUM_LEDS; i++) {
+          if (i < ledsToLight) {
+            matrix.setPixelColor(i, matrix.Color(0, 30, 45)); // Мягкий бирюзовый
+          } else {
+            matrix.setPixelColor(i, 0);
+          }
         }
+        matrix.show();
       }
-      matrix.show();
-    }
-  });
+    });
+  } else {
+    httpUpdate.onProgress(nullptr);
+  }
 
   t_httpUpdate_return ret = httpUpdate.update(client, cloudBinUrl);
 
@@ -998,10 +1007,12 @@ void performCloudUpdate() {
     case HTTP_UPDATE_FAILED:
       Serial.printf("[Cloud OTA] Сбой: (%d): %s\n", 
                     httpUpdate.getLastError(), httpUpdate.getLastErrorString().c_str());
-      // Мягкая красная индикация сбоя
-      for (int i = 0; i < NUM_LEDS; i++) matrix.setPixelColor(i, matrix.Color(40, 0, 0));
-      matrix.show();
-      delay(1500);
+      if (!silent) {
+        // Мягкая красная индикация сбоя только в интерактивном режиме
+        for (int i = 0; i < NUM_LEDS; i++) matrix.setPixelColor(i, matrix.Color(40, 0, 0));
+        matrix.show();
+        delay(1500);
+      }
       matrix.clear();
       matrix.show();
       isUpdatingCloudOta = false;
@@ -1014,10 +1025,16 @@ void performCloudUpdate() {
 
     case HTTP_UPDATE_OK:
       Serial.println("[Cloud OTA] Успех! Перезагрузка в новый раздел...");
-      // Мягкая зеленая индикация успеха
-      for (int i = 0; i < NUM_LEDS; i++) matrix.setPixelColor(i, matrix.Color(0, 45, 0));
-      matrix.show();
-      delay(800);
+      if (!silent) {
+        // Мягкая зеленая индикация успеха только в интерактивном режиме
+        for (int i = 0; i < NUM_LEDS; i++) matrix.setPixelColor(i, matrix.Color(0, 45, 0));
+        matrix.show();
+        delay(800);
+      } else {
+        matrix.clear();
+        matrix.show();
+        delay(100);
+      }
       ESP.restart();
       break;
   }
@@ -1670,7 +1687,9 @@ void setup() {
     }
     ArduinoOTA.setHostname("lamp");
     ArduinoOTA.begin();
-    triggerIpScroll(); // Запуск бегущей строки IP-адреса на матрице при подключении к Wi-Fi
+    if (lampOn) {
+      triggerIpScroll(); // Запуск бегущей строки IP-адреса на матрице при старте только если лампа включена
+    }
   }
 
   // 5. Роуты веб-сервера
@@ -1945,8 +1964,7 @@ void setup() {
   server.on("/api/ota/start", HTTP_POST, []() {
     if (cloudUpdateAvailable && cloudBinUrl.length() > 0) {
       server.send(200, "text/plain", "OK");
-      delay(200);
-      performCloudUpdate();
+      performCloudUpdate(false); // Ручной интерактивный запуск: показывать мягкий прогресс-бар
     } else {
       server.send(400, "text/plain", "No update available");
     }
