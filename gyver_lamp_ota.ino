@@ -13,12 +13,16 @@
 #include <LittleFS.h>
 #include <vector>
 #include "modular_effects.h"
+#include "audio_analyzer.h"
 
-#define FIRMWARE_VERSION  "1.1.2"
+#define FIRMWARE_VERSION  "1.2.0"
 
 // ================= НАСТРОЙКИ ОБОРУДОВАНИЯ =================
 #define PIN_MATRIX        2      // Пин данных матрицы WS2812B
 #define PIN_BUTTON        1      // Пин сенсорной кнопки TTP223
+#define PIN_I2S_SCK       4      // I2S BCLK микрофона INMP441
+#define PIN_I2S_WS        5      // I2S LRCLK микрофона INMP441
+#define PIN_I2S_SD        6      // I2S DOUT микрофона INMP441
 #define MATRIX_WIDTH      16     // Ширина матрицы
 #define MATRIX_HEIGHT     16     // Высота матрицы
 #define NUM_LEDS          (MATRIX_WIDTH * MATRIX_HEIGHT) // 256 диодов
@@ -105,15 +109,17 @@ uint8_t fast_noise8(uint16_t x, uint16_t y) {
 }
 
 ActiveModularEffect currentModularFx;
+AudioAnalyzer audio;
 
-// Битовая маска базовых эффектов в кнопке TTP223: bit0:fire, bit1:matrix, bit2:fireflies, bit3:solid (0x0F = все включены)
-uint8_t btnBuiltinMask = 0x0F;
+// Битовая маска базовых эффектов в кнопке TTP223: bit0:fire, bit1:matrix, bit2:fireflies, bit3:solid, bit4:sound_pulse (0x1F = все включены)
+uint8_t btnBuiltinMask = 0x1F;
 
 bool isBuiltinInBtn(const String& id) {
   if (id == "fire") return (btnBuiltinMask & 0x01) != 0;
   if (id == "matrix") return (btnBuiltinMask & 0x02) != 0;
   if (id == "fireflies") return (btnBuiltinMask & 0x04) != 0;
   if (id == "solid") return (btnBuiltinMask & 0x08) != 0;
+  if (id == "sound_pulse") return (btnBuiltinMask & 0x10) != 0;
   return false;
 }
 
@@ -122,6 +128,7 @@ void toggleBuiltinInBtn(const String& id) {
   else if (id == "matrix") btnBuiltinMask ^= 0x02;
   else if (id == "fireflies") btnBuiltinMask ^= 0x04;
   else if (id == "solid") btnBuiltinMask ^= 0x08;
+  else if (id == "sound_pulse") btnBuiltinMask ^= 0x10;
   
   Preferences p;
   p.begin("lamp_cfg", false);
@@ -373,6 +380,12 @@ bool activateEffect(String id) {
     currentEffectId = "solid";
     return true;
   }
+  if (id == "sound_pulse" || id == "4") {
+    lampEffect = 4;
+    isModularActive = false;
+    currentEffectId = "sound_pulse";
+    return true;
+  }
 
   if (fsAvailable) {
     String path = "/effects/" + id + ".fx";
@@ -406,6 +419,7 @@ void nextButtonEffect() {
   if (isBuiltinInBtn("matrix")) btnFxList.push_back("matrix");
   if (isBuiltinInBtn("fireflies")) btnFxList.push_back("fireflies");
   if (isBuiltinInBtn("solid")) btnFxList.push_back("solid");
+  if (isBuiltinInBtn("sound_pulse")) btnFxList.push_back("sound_pulse");
 
   if (fsAvailable) {
     auto modular = getInstalledModularList();
@@ -443,7 +457,9 @@ void loadLampSettings() {
   solidColor = prefsLamp.getUInt("color", 0xFFAA33);
   cloudManifestUrl = prefsLamp.getString("ota_url", "https://raw.githubusercontent.com/gaterkik/gyver-lamp/main/version.json");
   autoOtaEnabled = prefsLamp.getBool("auto_ota", true);
-  btnBuiltinMask = prefsLamp.getUChar("btn_builtin", 0x0F);
+  btnBuiltinMask = prefsLamp.getUChar("btn_builtin", 0x1F);
+  uint8_t sens = prefsLamp.getUChar("audio_sens", 50);
+  audio.setSensitivity(sens);
 
   // Бесшовная миграция со старого числового индекса на строковый ID
   if (prefsLamp.isKey("active_fx")) {
@@ -453,6 +469,7 @@ void loadLampSettings() {
     if (oldEffect == 1) currentEffectId = "matrix";
     else if (oldEffect == 2) currentEffectId = "fireflies";
     else if (oldEffect == 3) currentEffectId = "solid";
+    else if (oldEffect == 4) currentEffectId = "sound_pulse";
     else currentEffectId = "fire";
     prefsLamp.putString("active_fx", currentEffectId);
     Serial.printf("[NVS Migration] Преобразован старый индекс %u -> '%s'\n", oldEffect, currentEffectId.c_str());
@@ -632,6 +649,91 @@ void effectSolid() {
   }
 }
 
+// 6. Светомузыка / Пульс в такт музыке (INMP441)
+uint32_t colorWheel(uint8_t wheelPos) {
+  wheelPos = 255 - wheelPos;
+  if (wheelPos < 85) {
+    return matrix.Color(255 - wheelPos * 3, 0, wheelPos * 3);
+  }
+  if (wheelPos < 170) {
+    wheelPos -= 85;
+    return matrix.Color(0, wheelPos * 3, 255 - wheelPos * 3);
+  }
+  wheelPos -= 170;
+  return matrix.Color(wheelPos * 3, 255 - wheelPos * 3, 0);
+}
+
+void effectAudioPulse() {
+  uint8_t vol = audio.getVolume();          // 0..255
+  uint8_t beat = audio.getBeatIntensity();   // 0..255
+
+  static uint8_t baseHue = 0;
+  static uint8_t waveRadius = 0;
+  static bool waveActive = false;
+
+  // Медленный дрейф базовой палитры + ускорение при ударах баса
+  if (beat > 200) {
+    baseHue += 16;
+    waveActive = true;
+    waveRadius = 0;
+  } else {
+    baseHue += 1;
+  }
+
+  if (waveActive) {
+    waveRadius += 16;
+    if (waveRadius > 250) {
+      waveActive = false;
+    }
+  }
+
+  // Радиус светового ядра от громкости (от 20 до 220)
+  uint8_t currentRadius = map(vol, 0, 255, 20, 220);
+
+  for (int y = 0; y < MATRIX_HEIGHT; y++) {
+    for (int x = 0; x < MATRIX_WIDTH; x++) {
+      uint8_t d = distCenter[y][x]; // 0 (центр) .. 255 (края)
+
+      if (d <= currentRadius) {
+        // Внутри пульсирующего звукового ядра
+        uint8_t localBright = 255 - ((d * 180) / currentRadius);
+        uint8_t pixelHue = baseHue + (d >> 2);
+        uint32_t col = colorWheel(pixelHue);
+
+        // Вспышка на ударе баса
+        if (beat > 100 && d < 70) {
+          uint8_t r = min(255, (int)(((col >> 16) & 0xFF) + (beat >> 1)));
+          uint8_t g = min(255, (int)(((col >> 8) & 0xFF) + (beat >> 2)));
+          uint8_t b = min(255, (int)((col & 0xFF) + (beat >> 2)));
+          col = matrix.Color(r, g, b);
+        }
+
+        uint8_t r = (((col >> 16) & 0xFF) * localBright) >> 8;
+        uint8_t g = (((col >> 8) & 0xFF) * localBright) >> 8;
+        uint8_t b = ((col & 0xFF) * localBright) >> 8;
+        setPixel(x, y, matrix.Color(r, g, b));
+      } else {
+        // Прохождение взрывной волны бита
+        if (waveActive && abs((int)d - (int)waveRadius) < 25) {
+          uint8_t waveIntensity = 255 - abs((int)d - (int)waveRadius) * 10;
+          uint32_t waveCol = colorWheel(baseHue + 128);
+          uint8_t r = (((waveCol >> 16) & 0xFF) * waveIntensity) >> 8;
+          uint8_t g = (((waveCol >> 8) & 0xFF) * waveIntensity) >> 8;
+          uint8_t b = ((waveCol & 0xFF) * waveIntensity) >> 8;
+          setPixel(x, y, matrix.Color(r, g, b));
+        } else {
+          // Мягкое угасание хвоста волн
+          uint32_t cur = canvas[getPixelIndex(x, y)];
+          uint8_t r = ((cur >> 16) & 0xFF) * 70 >> 7;
+          uint8_t g = ((cur >> 8) & 0xFF) * 70 >> 7;
+          uint8_t b = (cur & 0xFF) * 70 >> 7;
+          setPixel(x, y, matrix.Color(r, g, b));
+        }
+      }
+    }
+  }
+}
+
 // ================= МОДУЛЬНАЯ ТАБЛИЦА ЭФФЕКТОВ =================
 typedef void (*EffectFunction)();
 
@@ -643,10 +745,11 @@ struct EffectDef {
 };
 
 const EffectDef effectsList[] = {
-  {"fire",      "🔥 Огонь",        effectFire,      30},
-  {"matrix",    "🟢 Матрица",      effectMatrix,    45},
-  {"fireflies", "✨ Светлячки",    effectFireflies, 35},
-  {"solid",     "💡 Ночник/Свет",  effectSolid,     50}
+  {"fire",        "🔥 Огонь",        effectFire,       30},
+  {"matrix",      "🟢 Матрица",      effectMatrix,     45},
+  {"fireflies",   "✨ Светлячки",    effectFireflies,  35},
+  {"solid",       "💡 Ночник/Свет",  effectSolid,      50},
+  {"sound_pulse", "🎵 Пульс музыки", effectAudioPulse, 25}
 };
 
 const uint8_t TOTAL_EFFECTS = sizeof(effectsList) / sizeof(effectsList[0]);
@@ -1213,6 +1316,10 @@ select, input { width:100%; padding:10px; border-radius:8px; border:1px solid #3
   effectOptions += "<option value='solid'";
   if (currentEffectId == "solid") effectOptions += " selected";
   effectOptions += ">💡 Ночник/Свет</option>";
+
+  effectOptions += "<option value='sound_pulse'";
+  if (currentEffectId == "sound_pulse") effectOptions += " selected";
+  effectOptions += ">🎵 Пульс музыки</option>";
   effectOptions += "</optgroup>";
 
   if (fsAvailable) {
@@ -1227,7 +1334,7 @@ select, input { width:100%; padding:10px; border-radius:8px; border:1px solid #3
   }
 
   String html = "";
-  html.reserve(6144);
+  html.reserve(8192);
   html += R"rawliteral(<!DOCTYPE html>
 <html lang="ru">
 <head>
@@ -1295,6 +1402,35 @@ select, input { width:100%; padding:10px; border-radius:8px; border:1px solid #3
         <input type="color" value="#)rawliteral";
   html += String(solidColor, HEX);
   html += R"rawliteral(" onchange="setColor(this.value)" style="width:100%; height:38px; border:none; border-radius:8px; cursor:pointer;">
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>🎤 Микрофон INMP441 (Светомузыка)</h2>
+      <p style="font-size:0.8rem; color:var(--muted); margin-bottom:12px;">
+        Цифровой I2S микрофон. При звучании музыки лампа пульсирует световыми кольцами и реагирует на басы. Если микрофон не подключен или вокруг тишина, эффект плавно переходит в мягкое дыхание.
+      </p>
+
+      <div class="row"><span>Статус микрофона:</span><span class="val" id="mic-status">Проверка...</span></div>
+      <div class="row"><span>Детекция звука:</span><span class="val" id="mic-sound">--</span></div>
+
+      <div class="grp" style="margin-top:12px;">
+        <div style="display:flex; justify-content:space-between;">
+          <label>Чувствительность микрофона:</label>
+          <span id="sens-val" style="font-size:0.85rem; font-weight:600;">)rawliteral";
+  html += String(audio.getSensitivity());
+  html += R"rawliteral(%</span>
+        </div>
+        <input type="range" id="sens-slider" min="10" max="100" value=")rawliteral";
+  html += String(audio.getSensitivity());
+  html += R"rawliteral(" onchange="setAudioSens(this.value)" oninput="document.getElementById('sens-val').innerText = this.value + '%'">
+      </div>
+
+      <div style="margin-top:8px;">
+        <label>Индикатор громкости (VU Meter):</label>
+        <div style="width:100%; height:12px; background:#0f172a; border-radius:6px; overflow:hidden; border:1px solid var(--border); margin-top:4px;">
+          <div id="vu-bar" style="width:0%; height:100%; background:linear-gradient(90deg, #22c55e, #eab308, #ef4444); transition:width 0.15s ease;"></div>
+        </div>
       </div>
     </div>
 
@@ -1605,7 +1741,36 @@ select, input { width:100%; padding:10px; border-radius:8px; border:1px solid #3
       };
       xhr.send(data);
     }
+    function setAudioSens(val) {
+      fetch('/api/audio/set?sens=' + val, { method: 'POST' });
+    }
+    function updateAudioStatus() {
+      fetch('/api/audio/status')
+        .then(r => r.json())
+        .then(d => {
+          const st = document.getElementById('mic-status');
+          const snd = document.getElementById('mic-sound');
+          const vu = document.getElementById('vu-bar');
+          if (st) {
+            st.innerHTML = d.ready 
+              ? '<span style="color:var(--success);">✓ Подключен (I2S OK)</span>' 
+              : '<span style="color:var(--muted);">Демо-режим (I2S не активен)</span>';
+          }
+          if (snd) {
+            snd.innerHTML = d.sound 
+              ? '<span style="color:var(--success); font-weight:bold;">Звук обнаружен 🎵</span>' 
+              : '<span style="color:var(--muted);">Тишина / Демо-дыхание</span>';
+          }
+          if (vu) {
+            const pct = Math.min(100, Math.round((d.vol / 255) * 100));
+            vu.style.width = pct + '%';
+          }
+        })
+        .catch(() => {});
+    }
     loadInstalledFx();
+    updateAudioStatus();
+    setInterval(updateAudioStatus, 1500);
   </script>
 </body></html>)rawliteral";
 
@@ -1701,10 +1866,13 @@ void setup() {
     }
   }
 
-  // 3. Загрузка сохраненных настроек лампы из NVS
+  // 3. Инициализация цифрового микрофона INMP441
+  audio.begin(PIN_I2S_SCK, PIN_I2S_WS, PIN_I2S_SD);
+
+  // 4. Загрузка сохраненных настроек лампы из NVS
   loadLampSettings();
 
-  // 4. Подключение к Wi-Fi или запуск точки доступа
+  // 5. Подключение к Wi-Fi или запуск точки доступа
   loadWifiCredentials();
   if (forceAP || !connectToWifi()) {
     startAccessPoint();
@@ -1719,7 +1887,7 @@ void setup() {
     }
   }
 
-  // 5. Роуты веб-сервера
+  // 6. Роуты веб-сервера
   server.on("/", HTTP_GET, handleRoot);
   server.on("/save_wifi", HTTP_POST, handleSaveWifi);
   server.on("/api/set", HTTP_GET, handleApiSet);
@@ -1741,7 +1909,8 @@ void setup() {
     json += "{\"id\":\"fire\",\"name\":\"🔥 Огонь\",\"in_btn\":" + String(isBuiltinInBtn("fire") ? "true" : "false") + "},";
     json += "{\"id\":\"matrix\",\"name\":\"🟢 Матрица\",\"in_btn\":" + String(isBuiltinInBtn("matrix") ? "true" : "false") + "},";
     json += "{\"id\":\"fireflies\",\"name\":\"✨ Светлячки\",\"in_btn\":" + String(isBuiltinInBtn("fireflies") ? "true" : "false") + "},";
-    json += "{\"id\":\"solid\",\"name\":\"💡 Ночник\",\"in_btn\":" + String(isBuiltinInBtn("solid") ? "true" : "false") + "}";
+    json += "{\"id\":\"solid\",\"name\":\"💡 Ночник\",\"in_btn\":" + String(isBuiltinInBtn("solid") ? "true" : "false") + "},";
+    json += "{\"id\":\"sound_pulse\",\"name\":\"🎵 Пульс музыки\",\"in_btn\":" + String(isBuiltinInBtn("sound_pulse") ? "true" : "false") + "}";
     json += "],";
     json += "\"modular\":[";
     if (fsAvailable) {
@@ -1914,7 +2083,7 @@ void setup() {
     String id = server.arg("id");
     id.trim();
 
-    if (id == "fire" || id == "matrix" || id == "fireflies" || id == "solid") {
+    if (id == "fire" || id == "matrix" || id == "fireflies" || id == "solid" || id == "sound_pulse") {
       toggleBuiltinInBtn(id);
       server.send(200, "application/json", "{\"success\":true}");
       return;
@@ -2020,11 +2189,45 @@ void setup() {
     }
   });
 
+  // 7. Роуты микрофона INMP441 (Светомузыка)
+  server.on("/api/audio/status", HTTP_GET, []() {
+    String json = "{";
+    json += "\"ready\":" + String(audio.isReady() ? "true" : "false") + ",";
+    json += "\"sound\":" + String(audio.isSound() ? "true" : "false") + ",";
+    json += "\"vol\":" + String(audio.getVolume()) + ",";
+    json += "\"raw\":" + String(audio.getRawVolume()) + ",";
+    json += "\"beat\":" + String(audio.getBeatIntensity()) + ",";
+    json += "\"sens\":" + String(audio.getSensitivity());
+    json += "}";
+    server.send(200, "application/json", json);
+  });
+
+  server.on("/api/audio/set", HTTP_POST, []() {
+    if (server.hasArg("sens")) {
+      uint8_t sens = constrain(server.arg("sens").toInt(), 10, 100);
+      audio.setSensitivity(sens);
+      Preferences p;
+      p.begin("lamp_cfg", false);
+      p.putUChar("audio_sens", sens);
+      p.end();
+      server.send(200, "application/json", "{\"success\":true,\"sens\":" + String(sens) + "}");
+    } else {
+      server.send(400, "application/json", "{\"error\":\"Missing sens parameter\"}");
+    }
+  });
+
   server.begin();
   Serial.println("[OK] Сервер запущен.");
 }
 
 void loop() {
+  // Неблокирующий опрос микрофона INMP441 через I2S DMA
+  static unsigned long lastAudioUpdate = 0;
+  if (millis() - lastAudioUpdate >= 15) {
+    lastAudioUpdate = millis();
+    audio.update();
+  }
+
   if (apMode) {
     dnsServer.processNextRequest();
     checkWifiScan(); // [QA AUDIT FIX] Неблокирующий опрос сканера сетей
