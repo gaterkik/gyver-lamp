@@ -15,7 +15,7 @@
 #include "modular_effects.h"
 #include "audio_analyzer.h"
 
-#define FIRMWARE_VERSION  "1.2.0"
+#define FIRMWARE_VERSION  "1.2.1"
 
 // ================= НАСТРОЙКИ ОБОРУДОВАНИЯ =================
 #define PIN_MATRIX        2      // Пин данных матрицы WS2812B
@@ -664,6 +664,42 @@ uint32_t colorWheel(uint8_t wheelPos) {
 }
 
 void effectAudioPulse() {
+  if (!audio.isSound()) {
+    // В тишине или когда микрофон не припаян: режим медитативного мягкого дыхания
+    static uint8_t breathHue = 0;
+    static unsigned long lastHueTime = 0;
+    if (millis() - lastHueTime > 40) {
+      lastHueTime = millis();
+      breathHue++;
+    }
+
+    uint8_t breath = (AudioAnalyzer::sin8(millis() / 16) * 160) >> 8; // 0..160
+    uint8_t currentRadius = 40 + (breath * 110) / 160;               // 40..150
+
+    for (int y = 0; y < MATRIX_HEIGHT; y++) {
+      for (int x = 0; x < MATRIX_WIDTH; x++) {
+        uint8_t d = distCenter[y][x];
+        if (d <= currentRadius) {
+          uint8_t localBright = 255 - ((d * 200) / currentRadius);
+          localBright = (localBright * (45 + breath)) >> 8;
+          uint32_t col = colorWheel(breathHue + (d >> 2));
+          uint8_t r = (((col >> 16) & 0xFF) * localBright) >> 8;
+          uint8_t g = (((col >> 8) & 0xFF) * localBright) >> 8;
+          uint8_t b = ((col & 0xFF) * localBright) >> 8;
+          setPixel(x, y, matrix.Color(r, g, b));
+        } else {
+          uint32_t cur = canvas[getPixelIndex(x, y)];
+          uint8_t r = ((cur >> 16) & 0xFF) * 60 >> 7;
+          uint8_t g = ((cur >> 8) & 0xFF) * 60 >> 7;
+          uint8_t b = (cur & 0xFF) * 60 >> 7;
+          setPixel(x, y, matrix.Color(r, g, b));
+        }
+      }
+    }
+    return;
+  }
+
+  // При наличии звука (музыки): светомузыка с кольцевыми волнами и реакцией на бас
   uint8_t vol = audio.getVolume();          // 0..255
   uint8_t beat = audio.getBeatIntensity();   // 0..255
 
@@ -1759,10 +1795,10 @@ select, input { width:100%; padding:10px; border-radius:8px; border:1px solid #3
           if (snd) {
             snd.innerHTML = d.sound 
               ? '<span style="color:var(--success); font-weight:bold;">Звук обнаружен 🎵</span>' 
-              : '<span style="color:var(--muted);">Тишина / Демо-дыхание</span>';
+              : '<span style="color:var(--muted);">Тишина / Микрофон не подключен</span>';
           }
           if (vu) {
-            const pct = Math.min(100, Math.round((d.vol / 255) * 100));
+            const pct = d.sound ? Math.min(100, Math.round((d.vol / 255) * 100)) : 0;
             vu.style.width = pct + '%';
           }
         })

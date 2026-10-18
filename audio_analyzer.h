@@ -37,6 +37,10 @@ public:
     _ws = ws;
     _din = din;
 
+    // Внутренняя подтяжка к земле на случай, если микрофон ещё не припаян
+    // Предотвращает ложный шум и наводки на висящем в воздухе пине данных
+    pinMode(_din, INPUT_PULLDOWN);
+
     i2s.setPins(_bclk, _ws, -1, _din);
     // 16 kHz, 32-bit slot, Stereo Philips format
     bool ok = i2s.begin(I2S_MODE_STD, 16000, I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_STEREO);
@@ -52,7 +56,9 @@ public:
 
   void update() {
     if (!initialized) {
-      updateDemoMode();
+      soundDetected = false;
+      volume = 0;
+      beatIntensity = 0;
       return;
     }
 
@@ -86,7 +92,7 @@ public:
       if (rawVolume > 15) {
         soundDetected = true;
         lastSoundTime = millis();
-      } else if (millis() - lastSoundTime > 2500) {
+      } else if (millis() - lastSoundTime > 2000) {
         soundDetected = false;
       }
 
@@ -115,27 +121,19 @@ public:
           beatIntensity = 255;
         }
       } else {
-        updateDemoMode();
+        // В тишине или без звука: громкость строго 0!
+        volume = 0;
+        beatIntensity = 0;
       }
     } else {
-      updateDemoMode();
+      soundDetected = false;
+      volume = 0;
+      beatIntensity = 0;
     }
 
     // Экспоненциальное затухание энергии удара
     if (beatIntensity > 0) {
       beatIntensity = (beatIntensity * 210) >> 8;
-    }
-  }
-
-  // Демо-режим (плавное дыхание при отсутствии микрофона или тишине)
-  void updateDemoMode() {
-    uint8_t breath = (sin8(millis() / 14) * 160) >> 8;
-    volume = 25 + (breath * 90) / 160;
-
-    static unsigned long lastVirtualBeat = 0;
-    if (millis() - lastVirtualBeat > 1600) {
-      lastVirtualBeat = millis();
-      beatIntensity = 190;
     }
   }
 
@@ -149,9 +147,9 @@ public:
     return sinTable[(angle >> 2) & 63];
   }
 
-  uint8_t getVolume() const { return volume; }
-  uint8_t getRawVolume() const { return rawVolume; }
-  uint8_t getBeatIntensity() const { return beatIntensity; }
+  uint8_t getVolume() const { return soundDetected ? volume : 0; }
+  uint16_t getRawVolume() const { return soundDetected ? rawVolume : 0; }
+  uint8_t getBeatIntensity() const { return soundDetected ? beatIntensity : 0; }
   bool isSound() const { return soundDetected; }
   bool isReady() const { return initialized; }
 
