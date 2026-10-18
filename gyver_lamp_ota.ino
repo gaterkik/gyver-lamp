@@ -14,7 +14,7 @@
 #include <vector>
 #include "modular_effects.h"
 
-#define FIRMWARE_VERSION  "1.1.1"
+#define FIRMWARE_VERSION  "1.1.2"
 
 // ================= НАСТРОЙКИ ОБОРУДОВАНИЯ =================
 #define PIN_MATRIX        2      // Пин данных матрицы WS2812B
@@ -105,6 +105,30 @@ uint8_t fast_noise8(uint16_t x, uint16_t y) {
 }
 
 ActiveModularEffect currentModularFx;
+
+// Битовая маска базовых эффектов в кнопке TTP223: bit0:fire, bit1:matrix, bit2:fireflies, bit3:solid (0x0F = все включены)
+uint8_t btnBuiltinMask = 0x0F;
+
+bool isBuiltinInBtn(const String& id) {
+  if (id == "fire") return (btnBuiltinMask & 0x01) != 0;
+  if (id == "matrix") return (btnBuiltinMask & 0x02) != 0;
+  if (id == "fireflies") return (btnBuiltinMask & 0x04) != 0;
+  if (id == "solid") return (btnBuiltinMask & 0x08) != 0;
+  return false;
+}
+
+void toggleBuiltinInBtn(const String& id) {
+  if (id == "fire") btnBuiltinMask ^= 0x01;
+  else if (id == "matrix") btnBuiltinMask ^= 0x02;
+  else if (id == "fireflies") btnBuiltinMask ^= 0x04;
+  else if (id == "solid") btnBuiltinMask ^= 0x08;
+  
+  Preferences p;
+  p.begin("lamp_cfg", false);
+  p.putUChar("btn_builtin", btnBuiltinMask);
+  p.end();
+  Serial.printf("[Кнопка] Базовый эффект '%s' переключен, маска=0x%02X\n", id.c_str(), btnBuiltinMask);
+}
 
 // ================= ОБЛАЧНЫЕ ОБНОВЛЕНИЯ (GITHUB CLOUD OTA) =================
 String cloudManifestUrl = "https://raw.githubusercontent.com/gaterkik/gyver-lamp/main/version.json";
@@ -378,10 +402,10 @@ bool activateEffect(String id) {
 
 void nextButtonEffect() {
   std::vector<String> btnFxList;
-  btnFxList.push_back("fire");
-  btnFxList.push_back("matrix");
-  btnFxList.push_back("fireflies");
-  btnFxList.push_back("solid");
+  if (isBuiltinInBtn("fire")) btnFxList.push_back("fire");
+  if (isBuiltinInBtn("matrix")) btnFxList.push_back("matrix");
+  if (isBuiltinInBtn("fireflies")) btnFxList.push_back("fireflies");
+  if (isBuiltinInBtn("solid")) btnFxList.push_back("solid");
 
   if (fsAvailable) {
     auto modular = getInstalledModularList();
@@ -392,7 +416,12 @@ void nextButtonEffect() {
     }
   }
 
-  int curIdx = 0;
+  // Защитный фоллбек: если пользователь снял галочки вообще со всех эффектов
+  if (btnFxList.empty()) {
+    btnFxList.push_back("fire");
+  }
+
+  int curIdx = -1;
   for (size_t i = 0; i < btnFxList.size(); i++) {
     if (btnFxList[i] == currentEffectId) {
       curIdx = i;
@@ -403,7 +432,7 @@ void nextButtonEffect() {
   int nextIdx = (curIdx + 1) % btnFxList.size();
   activateEffect(btnFxList[nextIdx]);
   markSettingsChanged();
-  Serial.printf("[Кнопка] Двойной клик: Эффект -> %s\n", currentEffectId.c_str());
+  Serial.printf("[Кнопка] Двойной клик: Эффект -> %s (всего в кнопке: %d)\n", currentEffectId.c_str(), (int)btnFxList.size());
 }
 
 // ================= ЭНЕРГОНЕЗАВИСИМАЯ ПАМЯТЬ (NVS / PREFERENCES) =================
@@ -414,6 +443,7 @@ void loadLampSettings() {
   solidColor = prefsLamp.getUInt("color", 0xFFAA33);
   cloudManifestUrl = prefsLamp.getString("ota_url", "https://raw.githubusercontent.com/gaterkik/gyver-lamp/main/version.json");
   autoOtaEnabled = prefsLamp.getBool("auto_ota", true);
+  btnBuiltinMask = prefsLamp.getUChar("btn_builtin", 0x0F);
 
   // Бесшовная миграция со старого числового индекса на строковый ID
   if (prefsLamp.isKey("active_fx")) {
@@ -981,6 +1011,7 @@ void performCloudUpdate(bool silent) {
   client.setInsecure();
 
   httpUpdate.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+  httpUpdate.rebootOnUpdate(false); // [КРИТИЧНО] Запрещаем автоматический reboot внутри httpUpdate, чтобы сработал зеленый всполох!
 
   // Мягкий неслепящий прогресс-бар на матрице показываем ТОЛЬКО в интерактивном режиме (ручной запуск)
   if (!silent) {
@@ -1009,7 +1040,7 @@ void performCloudUpdate(bool silent) {
                     httpUpdate.getLastError(), httpUpdate.getLastErrorString().c_str());
       if (!silent) {
         // Мягкая красная индикация сбоя только в интерактивном режиме
-        for (int i = 0; i < NUM_LEDS; i++) matrix.setPixelColor(i, matrix.Color(40, 0, 0));
+        for (int i = 0; i < NUM_LEDS; i++) matrix.setPixelColor(i, matrix.Color(50, 0, 0));
         matrix.show();
         delay(1500);
       }
@@ -1026,10 +1057,10 @@ void performCloudUpdate(bool silent) {
     case HTTP_UPDATE_OK:
       Serial.println("[Cloud OTA] Успех! Перезагрузка в новый раздел...");
       if (!silent) {
-        // Мягкая зеленая индикация успеха только в интерактивном режиме
-        for (int i = 0; i < NUM_LEDS; i++) matrix.setPixelColor(i, matrix.Color(0, 45, 0));
+        // Яркий красивый изумрудно-зеленый всполох на всей матрице (1200 мс)
+        for (int i = 0; i < NUM_LEDS; i++) matrix.setPixelColor(i, matrix.Color(0, 140, 30));
         matrix.show();
-        delay(800);
+        delay(1200);
       } else {
         matrix.clear();
         matrix.show();
@@ -1268,27 +1299,26 @@ select, input { width:100%; padding:10px; border-radius:8px; border:1px solid #3
     </div>
 
     <div class="card">
-      <div style="display:flex; justify-content:space-between; align-items:center;">
-        <h2>🎨 Галерея эффектов (LittleFS)</h2>
-        <button class="btn" style="width:auto; padding:6px 12px; font-size:0.8rem; background:#334155;" onclick="toggleFxGallery()">Открыть / Скрыть</button>
+      <h2>🔘 Ротация эффектов (кнопка TTP223)</h2>
+      <p style="font-size:0.8rem; color:var(--muted); margin-bottom:12px;">
+        Отметьте галочками эффекты, которые будут переключаться двойным нажатием сенсорной кнопки. Все эффекты сохраняются в памяти и могут быть включены кнопкой «Включить» или через выпадающий список выше.
+      </p>
+
+      <div id="installed-list" style="display:flex; flex-direction:column; gap:8px; margin-bottom:12px;">
+        <div style="font-size:0.8rem; color:var(--muted); text-align:center;">Загрузка списка эффектов...</div>
       </div>
 
-      <div id="fx-gallery" style="margin-top:14px; display:none;">
-        <h3 style="font-size:0.9rem; color:var(--accent); margin-bottom:8px;">📦 Установленные эффекты:</h3>
-        <div id="installed-list" style="display:flex; flex-direction:column; gap:8px; margin-bottom:16px;">
-          <div style="font-size:0.8rem; color:var(--muted); text-align:center;">Загрузка списка...</div>
-        </div>
+      <div style="margin-bottom:14px; font-size:0.75rem; color:var(--muted);" id="fs-info">
+        💾 Память LittleFS
+      </div>
 
+      <div style="border-top:1px solid var(--border); padding-top:12px;">
         <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
-          <h3 style="font-size:0.9rem; color:#38bdf8;">🌐 Каталог в облаке (GitHub):</h3>
-          <button class="btn" style="width:auto; padding:4px 10px; font-size:0.75rem; background:#0284c7;" onclick="loadCatalog()">🔄 Обновить</button>
+          <h3 style="font-size:0.9rem; color:#38bdf8;">🌐 Скачать новые эффекты (GitHub):</h3>
+          <button class="btn" style="width:auto; padding:5px 12px; font-size:0.75rem; background:#0284c7;" onclick="loadCatalog()">🔄 Каталог</button>
         </div>
         <div id="catalog-list" style="display:flex; flex-direction:column; gap:8px;">
-          <div style="font-size:0.8rem; color:var(--muted); text-align:center; padding:8px;">Нажмите «Обновить», чтобы загрузить каталог из GitHub</div>
-        </div>
-
-        <div style="margin-top:14px; font-size:0.75rem; color:var(--muted); border-top:1px solid var(--border); padding-top:8px;" id="fs-info">
-          Память эффектов: LittleFS
+          <div style="font-size:0.8rem; color:var(--muted); text-align:center; padding:6px;">Нажмите «Каталог», чтобы открыть магазин эффектов</div>
         </div>
       </div>
     </div>
@@ -1385,21 +1415,16 @@ select, input { width:100%; padding:10px; border-radius:8px; border:1px solid #3
       b.innerText = pwr ? "Питание: ВКЛ" : "Питание: ВЫКЛ";
       fetch('/api/set?power=' + (pwr ? '1' : '0'));
     }
-    function setEffect(val) { fetch('/api/set?effect=' + encodeURIComponent(val)); }
+    function setEffect(val) {
+      const sel = document.getElementById('eff-sel');
+      if (sel) sel.value = val;
+      fetch('/api/set?effect=' + encodeURIComponent(val)).then(() => loadInstalledFx());
+    }
     function setBrightness(val) {
       document.getElementById('brt-val').innerText = Math.round((val/255)*100) + '%';
       fetch('/api/set?bright=' + val);
     }
     function setColor(hex) { fetch('/api/set?color=' + hex.replace('#','')); }
-
-    let fxGalleryOpen = false;
-    function toggleFxGallery() {
-      fxGalleryOpen = !fxGalleryOpen;
-      document.getElementById('fx-gallery').style.display = fxGalleryOpen ? 'block' : 'none';
-      if (fxGalleryOpen) {
-        loadInstalledFx();
-      }
-    }
 
     function loadInstalledFx() {
       fetch('/api/effects/list')
@@ -1410,22 +1435,23 @@ select, input { width:100%; padding:10px; border-radius:8px; border:1px solid #3
           d.builtin.forEach(b => {
             const row = document.createElement('div');
             row.style = 'background:#0f172a; padding:8px 12px; border-radius:8px; display:flex; justify-content:space-between; align-items:center; border:1px solid var(--border);';
-            row.innerHTML = `<span style="font-size:0.85rem; font-weight:600;">${b.name} <span style="font-size:0.7rem; color:var(--muted);">(базовый)</span></span>
-                             <button class="btn" style="width:auto; padding:4px 8px; font-size:0.75rem; ${d.active === b.id ? 'background:var(--success);' : 'background:#334155;'}" onclick="setEffect('${b.id}')">${d.active === b.id ? 'Активен' : 'Включить'}</button>`;
+            row.innerHTML = `<label style="display:flex; align-items:center; gap:10px; font-size:0.85rem; font-weight:600; cursor:pointer; margin:0;">
+                               <input type="checkbox" id="chk-${b.id}" ${b.in_btn ? 'checked' : ''} onchange="toggleBtnFx('${b.id}')" style="width:18px; height:18px; accent-color:var(--accent); cursor:pointer;">
+                               <span>${b.name} <span style="font-size:0.7rem; color:var(--muted); font-weight:normal;">(базовый)</span></span>
+                             </label>
+                             <button class="btn" style="width:auto; padding:5px 10px; font-size:0.75rem; ${d.active === b.id ? 'background:var(--success);' : 'background:#334155;'}" onclick="setEffect('${b.id}')">${d.active === b.id ? 'Активен' : 'Включить'}</button>`;
             c.appendChild(row);
           });
           d.modular.forEach(m => {
             const row = document.createElement('div');
             row.style = 'background:#0f172a; padding:8px 12px; border-radius:8px; display:flex; justify-content:space-between; align-items:center; border:1px solid var(--border);';
-            row.innerHTML = `<div style="display:flex; flex-direction:column;">
-                               <span style="font-size:0.85rem; font-weight:600;">${m.name}</span>
-                               <label style="font-size:0.7rem; color:var(--muted); margin:4px 0 0; display:flex; align-items:center; gap:4px; cursor:pointer;">
-                                 <input type="checkbox" ${m.in_btn ? 'checked' : ''} onchange="toggleBtnFx('${m.id}')" style="width:auto;"> В кнопке TTP223
-                               </label>
-                             </div>
+            row.innerHTML = `<label style="display:flex; align-items:center; gap:10px; font-size:0.85rem; font-weight:600; cursor:pointer; margin:0;">
+                               <input type="checkbox" id="chk-${m.id}" ${m.in_btn ? 'checked' : ''} onchange="toggleBtnFx('${m.id}')" style="width:18px; height:18px; accent-color:var(--accent); cursor:pointer;">
+                               <span>${m.name}</span>
+                             </label>
                              <div style="display:flex; gap:6px;">
-                               <button class="btn" style="width:auto; padding:4px 8px; font-size:0.75rem; ${d.active === m.id ? 'background:var(--success);' : 'background:#334155;'}" onclick="setEffect('${m.id}')">${d.active === m.id ? 'Активен' : 'Включить'}</button>
-                               <button class="btn" style="width:auto; padding:4px 8px; font-size:0.75rem; background:var(--error);" onclick="deleteFx('${m.id}', '${m.name}')">🗑</button>
+                               <button class="btn" style="width:auto; padding:5px 10px; font-size:0.75rem; ${d.active === m.id ? 'background:var(--success);' : 'background:#334155;'}" onclick="setEffect('${m.id}')">${d.active === m.id ? 'Активен' : 'Включить'}</button>
+                               <button class="btn" style="width:auto; padding:5px 8px; font-size:0.75rem; background:var(--error);" onclick="deleteFx('${m.id}', '${m.name}')">🗑</button>
                              </div>`;
             c.appendChild(row);
           });
@@ -1579,6 +1605,7 @@ select, input { width:100%; padding:10px; border-radius:8px; border:1px solid #3
       };
       xhr.send(data);
     }
+    loadInstalledFx();
   </script>
 </body></html>)rawliteral";
 
@@ -1711,10 +1738,10 @@ void setup() {
     String json = "{";
     json += "\"active\":\"" + currentEffectId + "\",";
     json += "\"builtin\":[";
-    json += "{\"id\":\"fire\",\"name\":\"🔥 Огонь\",\"in_btn\":true},";
-    json += "{\"id\":\"matrix\",\"name\":\"🟢 Матрица\",\"in_btn\":true},";
-    json += "{\"id\":\"fireflies\",\"name\":\"✨ Светлячки\",\"in_btn\":true},";
-    json += "{\"id\":\"solid\",\"name\":\"💡 Ночник\",\"in_btn\":true}";
+    json += "{\"id\":\"fire\",\"name\":\"🔥 Огонь\",\"in_btn\":" + String(isBuiltinInBtn("fire") ? "true" : "false") + "},";
+    json += "{\"id\":\"matrix\",\"name\":\"🟢 Матрица\",\"in_btn\":" + String(isBuiltinInBtn("matrix") ? "true" : "false") + "},";
+    json += "{\"id\":\"fireflies\",\"name\":\"✨ Светлячки\",\"in_btn\":" + String(isBuiltinInBtn("fireflies") ? "true" : "false") + "},";
+    json += "{\"id\":\"solid\",\"name\":\"💡 Ночник\",\"in_btn\":" + String(isBuiltinInBtn("solid") ? "true" : "false") + "}";
     json += "],";
     json += "\"modular\":[";
     if (fsAvailable) {
@@ -1886,15 +1913,27 @@ void setup() {
     }
     String id = server.arg("id");
     id.trim();
-    auto list = getInstalledModularList();
-    for (auto& item : list) {
-      if (item.id == id) {
-        item.inBtn = !item.inBtn;
-        break;
-      }
+
+    if (id == "fire" || id == "matrix" || id == "fireflies" || id == "solid") {
+      toggleBuiltinInBtn(id);
+      server.send(200, "application/json", "{\"success\":true}");
+      return;
     }
-    saveInstalledModularList(list);
-    server.send(200, "application/json", "{\"success\":true}");
+
+    if (fsAvailable) {
+      auto list = getInstalledModularList();
+      for (auto& item : list) {
+        if (item.id == id) {
+          item.inBtn = !item.inBtn;
+          break;
+        }
+      }
+      saveInstalledModularList(list);
+      server.send(200, "application/json", "{\"success\":true}");
+      return;
+    }
+
+    server.send(404, "application/json", "{\"error\":\"Эффект не найден\"}");
   });
 
   // [QA FIX #2] Роуты перехвата для всплывающего окна Captive Portal на iOS и Android

@@ -1,5 +1,5 @@
 {
-  "version": "1.1.1",
+  "version": "1.1.2",
   "url": "https://raw.githubusercontent.com/gaterkik/gyver-lamp/main/gyver_lamp_ota.ino.bin",
-  "changelog": "Версия 1.1.1: Полностью тихий режим ночного автообновления (Silent Auto-OTA) — матрица не светится и не будит ночью."
+  "changelog": "Версия 1.1.2: Зелёный всполох успешного обновления прошивки, чекбоксы выбора эффектов в ротацию кнопки TTP223 для всех эффектов."
 }
